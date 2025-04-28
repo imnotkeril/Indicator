@@ -86,7 +86,10 @@ class ProgressiveAdaptiveVolatilityIndicator:
         self.micro_analyzer = MicroVolatilityAnalyzer(config.get('micro_volatility', {}))
         self.meso_analyzer = MesoVolatilityAnalyzer(config.get('meso_volatility', {}))
         self.macro_analyzer = MacroVolatilityAnalyzer(config.get('macro_volatility', {}))
-        self.regime_detector = RegimeDetector(config.get('regime_detector', {}))
+        regime_config = config.get('regime_detector', {})
+        n_regimes = regime_config.get('n_regimes', 4)
+        window_size = regime_config.get('window_size', 20)
+        self.regime_detector = RegimeDetector(n_regimes=n_regimes, window_size=window_size)
         self.fractal_analyzer = get_fractal_analyzer(config.get('fractal_analyzer', {}))
         self.cycle_analyzer = CycleAnalyzer(config.get('cycle_analyzer', {}))
         self.implied_vol_analyzer = ImpliedVolatilityAnalyzer(
@@ -183,11 +186,11 @@ class ProgressiveAdaptiveVolatilityIndicator:
         self.initialized = True
 
         # Connect signal generator to this indicator
-        self.signal_generator.set_volatility_indicator(self)
-
-        logger.info("All assets initialized")
-
-        return True
+        try:
+            self.signal_generator.set_volatility_indicator(self)
+            logger.info("Signal generator connected to volatility indicator")
+        except Exception as e:
+            logger.error(f"Error connecting signal generator: {e}")
 
     def initialize_with_test_data(self, start_date, end_date):
         """
@@ -499,19 +502,54 @@ class ProgressiveAdaptiveVolatilityIndicator:
         try:
             # Calculate on rolling windows
             window_size = self.config.get('fractal_window', 100)
-            returns = np.log(price_data['close']).diff().dropna()
+            # Убедимся, что значения положительные для логарифма
+            close_positive = np.maximum(price_data['close'], 1e-10)
+            returns = np.log(close_positive).diff().dropna()
 
-            hurst_series = []
-            fractal_dim_series = []
+            # Проверка, что у нас достаточно данных
+            if len(returns) < window_size:
+                logger.warning(f"Not enough data for fractal analysis: {len(returns)} < {window_size}")
+                vol_data['hurst_exponent'] = np.nan
+                vol_data['fractal_dimension'] = np.nan
+            else:
+                hurst_series = []
+                fractal_dim_series = []
 
-            # Use smaller step size for efficiency
-            step_size = max(1, window_size // 10)
+                # Use smaller step size for efficiency
+                step_size = max(1, window_size // 10)
 
-            for i in range(window_size, len(returns) + 1, step_size):
-                window = returns.iloc[i - window_size:i]
+                for i in range(window_size, len(returns) + 1, step_size):
+                    window = returns.iloc[i - window_size:i]
 
-                hurst = calculate_hurst_exponent(window)
-                fractal_dim = calculate_fractal_dimension(window)
+                    # Проверка на валидные данные
+                    if window.isnull().any() or len(window) < window_size:
+                        hurst = np.nan
+                        fractal_dim = np.nan
+                    else:
+                        try:
+                            hurst = calculate_hurst_exponent(window)
+                            fractal_dim = calculate_fractal_dimension(window)
+                        except Exception as calc_error:
+                            logger.warning(f"Error calculating fractal metrics: {calc_error}")
+                            hurst = np.nan
+                            fractal_dim = np.nan
+
+                    # Repeat value for all steps
+                    hurst_series.extend([hurst] * min(step_size, len(returns) - i + window_size))
+                    fractal_dim_series.extend([fractal_dim] * min(step_size, len(returns) - i + window_size))
+
+                # Adjust list length if needed
+                if len(hurst_series) > len(returns):
+                    hurst_series = hurst_series[:len(returns)]
+                    fractal_dim_series = fractal_dim_series[:len(returns)]
+                elif len(hurst_series) < len(returns):
+                    padding = [np.nan] * (len(returns) - len(hurst_series))
+                    hurst_series = padding + hurst_series
+                    fractal_dim_series = padding + fractal_dim_series
+
+                # Add to DataFrame with same index as returns
+                vol_data['hurst_exponent'] = pd.Series(hurst_series, index=returns.index)
+                vol_data['fractal_dimension'] = pd.Series(fractal_dim_series, index=returns.index)
 
                 # Repeat value for all steps
                 hurst_series.extend([hurst] * min(step_size, len(returns) - i + window_size))
@@ -590,7 +628,7 @@ class ProgressiveAdaptiveVolatilityIndicator:
         vol_data = self.volatility_data[asset]
 
         # Detect market regimes using the correct method
-        # Заменяем вызов несуществующего метода detect_regimes на fit_predict
+
         regimes = self.regime_detector.fit_predict(
             price_data,
             price_col='close',

@@ -717,8 +717,9 @@ def calculate_hurst_exponent(values, max_lag=20):
     if not isinstance(values, np.ndarray):
         values = np.array(values)
 
-    # Calculate returns
-    returns = np.diff(np.log(values))
+    # Ensure values are positive for log calculation
+    values_positive = np.maximum(values, 1e-10)
+    returns = np.diff(np.log(values_positive))
 
     # Calculate R/S for different lags
     rs_values = []

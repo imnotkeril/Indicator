@@ -62,6 +62,8 @@ class SignalGenerator:
         # Volatility indicator reference (will be set later)
         self.volatility_indicator = None
 
+
+
     def set_volatility_indicator(self, indicator):
         """
         Set the volatility indicator to use for signal generation.
@@ -71,7 +73,7 @@ class SignalGenerator:
         indicator : ProgressiveAdaptiveVolatilityIndicator
             The volatility indicator to use
         """
-        from engine.indicators.composite import ProgressiveAdaptiveVolatilityIndicator
+        from crypto_volatility_indicator.engine.indicators.composite import ProgressiveAdaptiveVolatilityIndicator
         if not isinstance(indicator, ProgressiveAdaptiveVolatilityIndicator):
             raise TypeError("Indicator must be a ProgressiveAdaptiveVolatilityIndicator")
 
