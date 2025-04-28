@@ -1,0 +1,93 @@
+# Crypto Volatility Indicator Configuration
+
+# Exchange Settings
+exchange:
+  name: binance
+  api_key: ""
+  api_secret: ""
+  timeout: 30
+
+# Assets to monitor
+symbols: 
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+
+# Timeframes for data collection
+timeframes:
+  - '1m'
+  - '5m'
+  - '15m'
+  - '1h'
+  - '4h'
+  - '1d'
+
+# Volatility Analysis Configuration
+volatility:
+  lookback_period: 20
+  fast_period: 2
+  slow_period: 30
+  implied_vol_weight: 0.3
+  realized_vol_weight: 0.7
+
+# Analysis Modules Configuration
+analysis:
+  fractal:
+    enabled: true
+    max_lag: 20
+  cycle:
+    enabled: true
+  regime:
+    enabled: true
+  implied_vol:
+    enabled: true
+    min_expiry_days: 1
+    max_expiry_days: 90
+
+# Prediction Model Configuration
+prediction:
+  model_type: hybrid
+  training_interval: 1d
+  retraining_frequency: 1w
+  use_lstm: true
+  lstm_seq_length: 10
+  lstm_units: 50
+  lstm_dropout: 0.2
+
+# Visualization and Monitoring
+visualization:
+  charts_enabled: true
+  dashboard_enabled: false
+  alerts_enabled: true
+
+# API and Websocket Configuration
+api:
+  rest_enabled: false
+  rest_port: 8000
+  websocket_enabled: false
+  websocket_port: 8001
+
+# Logging Configuration
+logging:
+  level: INFO
+  file: volatility_indicator.log
+  console: true
+
+# Machine Learning Model Weights
+ml_models:
+  ensemble_weights:
+    rf: 0.3
+    gb: 0.3
+    en: 0.2
+    lstm: 0.2
+
+# Regime Detection Parameters
+regime_detector:
+  n_regimes: 4
+  window_size: 20
+
+# KAMA Indicator Configuration
+kama:
+  er_period: 10
+  fast_ef: 0.666
+  slow_ef: 0.0645

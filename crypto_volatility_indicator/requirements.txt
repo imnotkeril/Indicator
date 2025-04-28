@@ -1,0 +1,9 @@
+# Project dependencies
+numpy
+pandas
+ccxt
+scipy
+sklearn
+matplotlib
+pywt
+tensorflow
