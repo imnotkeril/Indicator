@@ -13,6 +13,7 @@ import logging
 import json
 from functools import lru_cache
 import ccxt  # For exchange data
+from ccxt.base.errors import NetworkError, ExchangeError
 import os
 import sys
 
@@ -40,9 +41,7 @@ from crypto_volatility_indicator.engine.indicators.signals import SignalGenerato
 logger = get_logger(__name__)
 
 
-class KaufmanAdaptiveMovingAverage:
-    pass
-
+from crypto_volatility_indicator.engine.indicators.kama import KAMAIndicator
 
 class ProgressiveAdaptiveVolatilityIndicator:
     """
@@ -90,7 +89,10 @@ class ProgressiveAdaptiveVolatilityIndicator:
         self.regime_detector = RegimeDetector(config.get('regime_detector', {}))
         self.fractal_analyzer = get_fractal_analyzer(config.get('fractal_analyzer', {}))
         self.cycle_analyzer = CycleAnalyzer(config.get('cycle_analyzer', {}))
-        self.implied_vol_analyzer = ImpliedVolatilityAnalyzer(config.get('implied_volatility', {}))
+        self.implied_vol_analyzer = ImpliedVolatilityAnalyzer(
+            exchange_id=self.config.get('exchange_id', 'deribit'),
+            symbol=self.config.get('implied_vol_symbol', 'BTC/USD')
+        )
 
         # Initialize adaptive KAMA
         self.kama_params = self.config.get('kama', {})
@@ -358,48 +360,73 @@ class ProgressiveAdaptiveVolatilityIndicator:
         """
         all_data = []
 
+        # Устанавливаем максимальное количество попыток
+        max_retries = 3
+        retry_delay = 5  # секунды
+
+        # Проверяем доступность биржи
+        if self.exchange is None:
+            raise ValueError(f"Exchange not initialized properly for {asset}")
+
         # Fetch data for each timeframe
         for timeframe in self.timeframes:
-            try:
-                # Validate timeframe
-                valid_timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d',
-                                    '1w', '1M']
-                if timeframe not in valid_timeframes:
-                    logger.warning(f"Invalid timeframe: {timeframe}. Using default '1h'.")
-                    timeframe = '1h'
+            for attempt in range(1, max_retries + 1):
+                try:
+                    # Validate timeframe
+                    valid_timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d',
+                                        '1w', '1M']
+                    if timeframe not in valid_timeframes:
+                        logger.warning(f"Invalid timeframe: {timeframe}. Using default '1h'.")
+                        timeframe = '1h'
 
-                # Fetch OHLCV data
-                ohlcv = self.exchange.fetch_ohlcv(
-                    symbol=asset,
-                    timeframe=timeframe,
-                    limit=self.history_limit
-                )
+                    # Fetch OHLCV data
+                    ohlcv = self.exchange.fetch_ohlcv(
+                        symbol=asset,
+                        timeframe=timeframe,
+                        limit=self.history_limit
+                    )
 
-                if not ohlcv:
-                    logger.warning(f"No data returned for {asset} ({timeframe})")
-                    continue
+                    if not ohlcv:
+                        logger.warning(f"No data returned for {asset} ({timeframe})")
+                        continue
 
-                # Convert to DataFrame
-                df = pd.DataFrame(
-                    ohlcv,
-                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-                )
+                    # Convert to DataFrame
+                    df = pd.DataFrame(
+                        ohlcv,
+                        columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                    )
 
-                # Convert timestamp to datetime
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df.set_index('timestamp', inplace=True)
+                    # Convert timestamp to datetime
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df.set_index('timestamp', inplace=True)
 
-                # Store the data
-                all_data.append((timeframe, df))
+                    # Store the data
+                    all_data.append((timeframe, df))
 
-                logger.debug(f"Fetched {len(df)} candlesticks for {asset} ({timeframe})")
+                    logger.debug(f"Fetched {len(df)} candlesticks for {asset} ({timeframe})")
 
-                # Avoid rate limiting
-                time.sleep(self.exchange.rateLimit / 1000)
+                    # Avoid rate limiting
+                    time.sleep(self.exchange.rateLimit / 1000)
 
-            except Exception as e:
-                logger.error(f"Error fetching {asset} ({timeframe}): {str(e)}")
-                raise
+                    # Успешно получили данные, выходим из цикла попыток
+                    break
+
+                except ccxt.NetworkError as e:
+                    if attempt < max_retries:
+                        logger.warning(
+                            f"Network error fetching {asset} ({timeframe}), attempt {attempt}/{max_retries}: {e}. Retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                    else:
+                        logger.error(f"Network error fetching {asset} ({timeframe}) after {max_retries} attempts: {e}")
+                        raise
+
+                except ccxt.ExchangeError as e:
+                    logger.error(f"Exchange error fetching {asset} ({timeframe}): {e}")
+                    raise
+
+                except Exception as e:
+                    logger.error(f"Unexpected error fetching {asset} ({timeframe}): {e}")
+                    raise
 
         # Store only the most granular timeframe in price_data
         if all_data:
@@ -428,16 +455,30 @@ class ProgressiveAdaptiveVolatilityIndicator:
 
         price_data = self.price_data[asset]
 
+        # Сначала создаем возвраты, так как они отсутствуют
+        if 'log_return' not in price_data.columns:
+            # Рассчитываем логарифмические возвраты
+            price_data['log_return'] = np.log(price_data['close'] / price_data['close'].shift(1))
+            # Заполняем первое значение нулем
+            price_data.loc[price_data.index[0], 'log_return'] = 0
+
         # Calculate different volatility measures
-        micro_vol = self.micro_analyzer.calculate_volatility(price_data)
-        meso_vol = self.meso_analyzer.calculate_volatility(price_data)
-        macro_vol = self.macro_analyzer.calculate_volatility(price_data)
+        micro_vol_df = self.micro_analyzer.calculate_historical_volatility(price_data)
+        meso_vol_df = self.meso_analyzer.calculate_historical_volatility(price_data)
+        macro_vol_df = self.macro_analyzer.calculate_historical_volatility(price_data)
 
         # Create volatility DataFrame
         vol_data = pd.DataFrame(index=price_data.index)
-        vol_data['micro_vol'] = micro_vol
-        vol_data['meso_vol'] = meso_vol
-        vol_data['macro_vol'] = macro_vol
+
+        # Выбираем одну колонку волатильности из каждого DataFrame
+        # Используем волатильность с окном среднего размера
+        micro_vol_col = f'volatility_{self.micro_analyzer.window_sizes[2]}'
+        meso_vol_col = f'volatility_{self.meso_analyzer.window_sizes[2]}'
+        macro_vol_col = f'volatility_{self.macro_analyzer.window_sizes[2]}'
+
+        vol_data['micro_vol'] = micro_vol_df[micro_vol_col] if micro_vol_col in micro_vol_df.columns else None
+        vol_data['meso_vol'] = meso_vol_df[meso_vol_col] if meso_vol_col in meso_vol_df.columns else None
+        vol_data['macro_vol'] = macro_vol_df[macro_vol_col] if macro_vol_col in macro_vol_df.columns else None
 
         # Calculate composite volatility
         weights = self.config.get('volatility_weights', {
@@ -446,11 +487,13 @@ class ProgressiveAdaptiveVolatilityIndicator:
             'macro': 0.2
         })
 
-        vol_data['composite_vol'] = (
-                weights['micro'] * vol_data['micro_vol'] +
-                weights['meso'] * vol_data['meso_vol'] +
-                weights['macro'] * vol_data['macro_vol']
-        )
+        # Убедимся, что все колонки существуют перед расчетом композитной волатильности
+        if all(col in vol_data.columns for col in ['micro_vol', 'meso_vol', 'macro_vol']):
+            vol_data['composite_vol'] = (
+                    weights['micro'] * vol_data['micro_vol'] +
+                    weights['meso'] * vol_data['meso_vol'] +
+                    weights['macro'] * vol_data['macro_vol']
+            )
 
         # Calculate fractal metrics
         try:
@@ -513,14 +556,15 @@ class ProgressiveAdaptiveVolatilityIndicator:
         close_prices = self.price_data[asset]['close']
 
         # Create KAMA instance
-        kama = KaufmanAdaptiveMovingAverage(
-            fast_length=self.kama_params.get('fast_length', 2),
-            slow_length=self.kama_params.get('slow_length', 30),
-            efficiency_length=self.kama_params.get('efficiency_length', 10)
+        kama = KAMAIndicator(
+            er_period=self.kama_params.get('er_period', 10),
+            fast_ef=self.kama_params.get('fast_ef', 0.666),
+            slow_ef=self.kama_params.get('slow_ef', 0.0645)
         )
 
         # Calculate KAMA values
-        kama_values = kama.calculate(close_prices)
+        kama_result = kama.calculate(pd.DataFrame({'close': close_prices}))
+        kama_values = kama_result['kama'] if 'kama' in kama_result.columns else None
 
         # Store the KAMA instance and values
         self.kama[asset] = {
@@ -545,8 +589,13 @@ class ProgressiveAdaptiveVolatilityIndicator:
         price_data = self.price_data[asset]
         vol_data = self.volatility_data[asset]
 
-        # Detect market regimes
-        regimes = self.regime_detector.detect_regimes(price_data, vol_data)
+        # Detect market regimes using the correct method
+        # Заменяем вызов несуществующего метода detect_regimes на fit_predict
+        regimes = self.regime_detector.fit_predict(
+            price_data,
+            price_col='close',
+            vol_col='composite_vol' if 'composite_vol' in vol_data.columns else None
+        )
 
         # Store regime data
         self.regime_data[asset] = regimes
@@ -577,12 +626,13 @@ class ProgressiveAdaptiveVolatilityIndicator:
         vol_data = self.volatility_data[asset]
         regime_data = self.regime_data.get(asset, None)
 
-        # Combined data for training
-        combined_data = price_data[['close']].copy()
+        # Combined data for training - используйте переименование колонок, чтобы избежать конфликта
+        combined_data = price_data[['close']].copy().rename(columns={'close': 'price_close'})
         combined_data = combined_data.join(vol_data)
 
         if regime_data is not None:
-            combined_data = combined_data.join(regime_data)
+            # Добавьте суффиксы, чтобы избежать конфликта колонок
+            combined_data = combined_data.join(regime_data, lsuffix='_vol', rsuffix='_regime')
 
         # Clean up missing values
         combined_data = combined_data.dropna()
@@ -769,9 +819,9 @@ class ProgressiveAdaptiveVolatilityIndicator:
             return
 
         # Calculate new volatility measures
-        micro_vol = self.micro_analyzer.calculate_volatility(price_data)
-        meso_vol = self.meso_analyzer.calculate_volatility(price_data)
-        macro_vol = self.macro_analyzer.calculate_volatility(price_data)
+        micro_vol = self.micro_analyzer.calculate_historical_volatility(price_data)
+        meso_vol = self.meso_analyzer.calculate_historical_volatility(price_data)
+        macro_vol = self.macro_analyzer.calculate_historical_volatility(price_data)
 
         # Create new volatility DataFrame
         new_vol_data = pd.DataFrame(index=price_data.index)
@@ -887,8 +937,12 @@ class ProgressiveAdaptiveVolatilityIndicator:
             logger.debug(f"No new data for regime update for {asset}")
             return
 
-        # Detect market regimes
-        new_regimes = self.regime_detector.detect_regimes(price_data, vol_data)
+        # Detect market regimes using fit_predict instead of detect_regimes
+        new_regimes = self.regime_detector.fit_predict(
+            price_data,
+            price_col='close',
+            vol_col='composite_vol' if 'composite_vol' in vol_data.columns else None
+        )
 
         # Combine old and new data
         combined_regimes = pd.concat([current_regime_data, new_regimes])
@@ -1233,45 +1287,6 @@ class ProgressiveAdaptiveVolatilityIndicator:
         """
         return asset in self.assets
 
-    def calculate_stop_loss(self, price_data=None, volatility_data=None, position_type='long', asset=None):
-        """
-        Calculate dynamic stop loss levels.
-
-        Parameters:
-        -----------
-        price_data : pd.DataFrame, optional
-            Price data
-        volatility_data : pd.DataFrame, optional
-            Volatility data
-        position_type : str
-            'long' or 'short'
-        asset : str, optional
-            Asset symbol
-
-        Returns:
-        --------
-        pd.Series
-            Stop loss levels
-        """
-        # If no explicit data provided, use data for specified asset
-        if price_data is None or volatility_data is None:
-            if asset is None and self.assets:
-                asset = self.assets[0]
-
-            if asset not in self.price_data or asset not in self.volatility_data:
-                logger.warning(f"No data for {asset}")
-                return None
-
-            price_data = self.price_data[asset]
-            volatility_data = self.volatility_data[asset]
-
-        # Use signal generator to calculate take profit
-        return self.signal_generator.calculate_take_profit(
-            price_data=price_data,
-            volatility_data=volatility_data,
-            position_type=position_type
-        )
-
     def save_data(self, directory=None):
         """
         Save all data to files.
@@ -1494,6 +1509,104 @@ class ProgressiveAdaptiveVolatilityIndicator:
         logger.info(f"Asset {asset} removed successfully")
         return True
 
+    def fetch_blockchain_metrics(self, asset=None):
+        """
+        Fetch blockchain metrics for an asset.
+
+        Parameters:
+        -----------
+        asset : str, optional
+            Asset symbol
+
+        Returns:
+        --------
+        pd.DataFrame
+            Blockchain metrics data
+        """
+        if asset is None and self.assets:
+            asset = self.assets[0]
+
+        # Placeholder for actual blockchain data fetching
+        logger.info(f"Fetching blockchain metrics for {asset}")
+
+        # Here you would integrate with blockchain data providers
+        # For now, return empty DataFrame
+        return pd.DataFrame()
+
+    def integrate_network_metrics(self, asset=None):
+        """
+        Integrate network metrics with volatility data.
+
+        Parameters:
+        -----------
+        asset : str, optional
+            Asset symbol
+
+        Returns:
+        --------
+        pd.DataFrame
+            Integrated data
+        """
+        if asset is None and self.assets:
+            asset = self.assets[0]
+
+        if asset not in self.volatility_data:
+            logger.warning(f"No volatility data for {asset}")
+            return None
+
+        # Fetch blockchain metrics
+        blockchain_data = self.fetch_blockchain_metrics(asset)
+
+        if blockchain_data.empty:
+            logger.warning(f"No blockchain data available for {asset}")
+            return self.volatility_data[asset]
+
+        # Merge with volatility data
+        vol_data = self.volatility_data[asset]
+
+        # Here you would perform the actual integration
+        # For now, just return the volatility data
+        return vol_data
+
+    def calculate_stop_loss(self, price_data=None, volatility_data=None, position_type='long', asset=None):
+        """
+        Calculate dynamic stop loss levels.
+
+        Parameters:
+        -----------
+        price_data : pd.DataFrame, optional
+            Price data
+        volatility_data : pd.DataFrame, optional
+            Volatility data
+        position_type : str
+            'long' or 'short'
+        asset : str, optional
+            Asset symbol
+
+        Returns:
+        --------
+        pd.Series
+            Stop loss levels
+        """
+        # If no explicit data provided, use data for specified asset
+        if price_data is None or volatility_data is None:
+            if asset is None and self.assets:
+                asset = self.assets[0]
+
+            if asset not in self.price_data or asset not in self.volatility_data:
+                logger.warning(f"No data for {asset}")
+                return None
+
+            price_data = self.price_data[asset]
+            volatility_data = self.volatility_data[asset]
+
+        # Use signal generator to calculate stop loss
+        return self.signal_generator.calculate_stop_loss(
+            price_data=price_data,
+            volatility_data=volatility_data,
+            position_type=position_type
+        )
+
     def __str__(self):
         """String representation of the indicator."""
         assets_str = ", ".join(self.assets)
@@ -1504,13 +1617,6 @@ class ProgressiveAdaptiveVolatilityIndicator:
     def __repr__(self):
         """Detailed representation of the indicator."""
         return self.__str__() + f" at {hex(id(self))}"
-
-        # Use signal generator to calculate stop loss
-        return self.signal_generator.calculate_stop_loss(
-            price_data=price_data,
-            volatility_data=volatility_data,
-            position_type=position_type
-        )
 
     def calculate_take_profit(self, price_data=None, volatility_data=None, position_type='long', asset=None):
         """
@@ -1539,3 +1645,14 @@ class ProgressiveAdaptiveVolatilityIndicator:
 
             if asset not in self.price_data or asset not in self.volatility_data:
                 logger.warning(f"No data for {asset}")
+                return None
+
+            price_data = self.price_data[asset]
+            volatility_data = self.volatility_data[asset]
+
+        # Use signal generator to calculate take profit
+        return self.signal_generator.calculate_take_profit(
+            price_data=price_data,
+            volatility_data=volatility_data,
+            position_type=position_type
+        )
